@@ -1,0 +1,145 @@
+import socket
+import cv2
+import threading
+import numpy as np
+import pyautogui
+import ctypes
+import sys
+from pynput.keyboard import Listener as KeyListener
+from pynput.mouse import Listener as MouseListener, Button, Controller as MouseCtrl
+
+screen_socket = None
+keyboard_socket = None
+mouse_socket = None
+
+shutdown_flag = threading.Event()  # shared flag to coordinate shutdown
+
+def send_keyboard_command(command):
+    try:
+        keyboard_socket.sendall(f"COMMAND:KEYBOARD:{command}\n".encode())
+    except:
+        pass
+
+def send_mouse_command(command):
+    try:
+        mouse_socket.sendall(f"COMMAND:MOUSE:{command}\n".encode())
+    except:
+        pass
+
+def on_press(key):
+    try:
+        key_str = key.char if hasattr(key, 'char') and key.char is not None else str(key).replace("Key.", "")
+        send_keyboard_command(f"PRESS:{key_str}")
+    except:
+        pass
+
+def on_release(key):
+    try:
+        key_str = key.char if hasattr(key, 'char') and key.char is not None else str(key).replace("Key.", "")
+        send_keyboard_command(f"RELEASE:{key_str}")
+
+        if str(key) == 'Key.esc':
+            send_keyboard_command("SHUTDOWN")
+            send_mouse_command("SHUTDOWN")
+            shutdown_flag.set()
+            close_all()
+    except:
+        pass
+
+def on_move(x, y):
+    if not shutdown_flag.is_set():
+        send_mouse_command(f"MOVE:{x},{y}")
+
+def on_click(x, y, button, pressed):
+    if not shutdown_flag.is_set() and pressed:
+        btn = "left" if button == Button.left else "right" if button == Button.right else "middle"
+        send_mouse_command(f"CLICK:{btn}")
+
+def on_scroll(x, y, dx, dy):
+    if not shutdown_flag.is_set():
+        direction = "up" if dy > 0 else "down"
+        send_mouse_command(f"SCROLL:{direction}")
+
+def start_keyboard_listener():
+    with KeyListener(on_press=on_press, on_release=on_release) as listener:
+        listener.join()
+
+def start_mouse_listener():
+    with MouseListener(on_move=on_move, on_click=on_click, on_scroll=on_scroll) as listener:
+        listener.join()
+
+def receive_frame(sock):
+    try:
+        size_data = sock.recv(4)
+        if not size_data:
+            return None
+        size = int.from_bytes(size_data, 'big')
+        data = b""
+        while len(data) < size:
+            packet = sock.recv(size - len(data))
+            if not packet:
+                return None
+            data += packet
+        return data
+    except:
+        return None
+
+def start_screen_display():
+    global screen_socket
+    cv2.namedWindow("Remote Screen", cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty("Remote Screen", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 3)
+
+    while not shutdown_flag.is_set():
+        frame_data = receive_frame(screen_socket)
+        if frame_data is None:
+            break
+
+        img_np = np.frombuffer(frame_data, dtype=np.uint8)
+        img = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+
+        screen_width, screen_height = pyautogui.size()
+        img = cv2.resize(img, (screen_width, screen_height))
+        cv2.imshow("Remote Screen", img)
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+    cv2.destroyAllWindows()
+    shutdown_flag.set()
+    close_all()
+
+def close_all():
+    try:
+        screen_socket.close()
+        keyboard_socket.close()
+        mouse_socket.close()
+    except:
+        pass
+    sys.exit(0)
+
+def start_client(ip, screen_port, keyboard_port, mouse_port):
+    global screen_socket, keyboard_socket, mouse_socket
+
+    screen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    keyboard_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    mouse_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    screen_socket.connect((ip, screen_port))
+    keyboard_socket.connect((ip, keyboard_port))
+    mouse_socket.connect((ip, mouse_port))
+
+    threads = [
+        threading.Thread(target=start_screen_display),
+        threading.Thread(target=start_keyboard_listener),
+        threading.Thread(target=start_mouse_listener)
+    ]
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+if __name__ == "__main__":
+    start_client("0.0.0.0", 8965, 8966, 8967)
