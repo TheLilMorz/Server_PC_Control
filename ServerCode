@@ -1,0 +1,139 @@
+import socket
+import mss
+import numpy as np
+import cv2
+import threading
+from pynput.keyboard import Controller as KeyboardController, Key
+from pynput.mouse import Controller as MouseController, Button
+
+keyboard = KeyboardController()
+mouse = MouseController()
+
+def process_mouse_command(command):
+    try:
+        if command.startswith("MOVE:"):
+            _, coords = command.split(":", 1)
+            x, y = map(int, coords.split(","))
+            mouse.position = (x, y)
+        elif command.startswith("CLICK:"):
+            _, btn = command.split(":", 1)
+            button = {"left": Button.left, "right": Button.right, "middle": Button.middle}.get(btn)
+            if button:
+                mouse.click(button)
+        elif command.startswith("SCROLL:"):
+            _, direction = command.split(":", 1)
+            dy = 2 if direction == "up" else -2
+            mouse.scroll(0, dy)
+    except:
+        pass
+
+def process_keyboard_commands(full_command):
+    try:
+        parts = full_command.strip().split(":")
+        if len(parts) < 4:
+            return
+        _, action, key = parts[1], parts[2], parts[3]
+        key_obj = getattr(Key, key, key)
+        if action == "PRESS":
+            keyboard.press(key_obj)
+        elif action == "RELEASE":
+            keyboard.release(key_obj)
+    except:
+        pass
+
+def handle_keyboard_commands(keyboard_socket):
+    while True:
+        try:
+            data = keyboard_socket.recv(1024).decode()
+            if not data:
+                break
+            for command in data.strip().split("\n"):
+                if command.startswith("COMMAND:KEYBOARD:"):
+                    process_keyboard_commands(command)
+        except:
+            break
+
+def handle_mouse_commands(mouse_socket):
+    while True:
+        try:
+            data = mouse_socket.recv(1024).decode()
+            if not data:
+                break
+            for command in data.strip().split("\n"):
+                if command.startswith("COMMAND:MOUSE:"):
+                    process_mouse_command(command.replace("COMMAND:MOUSE:", ""))
+        except:
+            break
+
+def send_frame(screen_socket, frame):
+    try:
+        size = len(frame)
+        screen_socket.sendall(size.to_bytes(4, 'big'))
+        screen_socket.sendall(frame)
+    except:
+        raise
+
+def start_screen_sharing(screen_socket):
+    screen_socket.settimeout(2)
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]
+        while True:
+            try:
+                img = sct.grab(monitor)
+                img_np = np.array(img)
+                img_bgr = cv2.cvtColor(img_np, cv2.COLOR_BGRA2BGR)
+                screen_width = monitor["width"]
+                screen_height = monitor["height"]
+                img_resized = cv2.resize(img_bgr, (screen_width, screen_height))
+                _, img_encoded = cv2.imencode('.jpg', img_resized, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                send_frame(screen_socket, img_encoded.tobytes())  
+            except:
+                break
+
+def handle_client(screen_socket, keyboard_socket, mouse_socket):
+    screen_thread = threading.Thread(target=start_screen_sharing, args=(screen_socket,))
+    keyboard_thread = threading.Thread(target=handle_keyboard_commands, args=(keyboard_socket,))
+    mouse_thread = threading.Thread(target=handle_mouse_commands, args=(mouse_socket,))
+
+    screen_thread.daemon = True
+    keyboard_thread.daemon = True
+    mouse_thread.daemon = True
+
+    screen_thread.start()
+    keyboard_thread.start()
+    mouse_thread.start()
+
+    screen_thread.join()
+    keyboard_thread.join()
+    mouse_thread.join()
+
+    screen_socket.close()
+    keyboard_socket.close()
+    mouse_socket.close()
+
+def start_server(IP, SCREEN_PORT, KEYBOARD_PORT, MOUSE_PORT):
+    screen_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    keyboard_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    mouse_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    screen_server.bind((IP, SCREEN_PORT))
+    keyboard_server.bind((IP, KEYBOARD_PORT))
+    mouse_server.bind((IP, MOUSE_PORT))
+
+    screen_server.listen(1)
+    keyboard_server.listen(1)
+    mouse_server.listen(1)
+
+    while True:
+        screen_socket, _ = screen_server.accept()
+        keyboard_socket, _ = keyboard_server.accept()
+        mouse_socket, _ = mouse_server.accept()
+        client_handler = threading.Thread(
+            target=handle_client,
+            args=(screen_socket, keyboard_socket, mouse_socket) 
+        )
+        client_handler.daemon = True
+        client_handler.start()
+
+if __name__ == "__main__": 
+    start_server("0.0.0.0", 8965, 8966, 8967)
